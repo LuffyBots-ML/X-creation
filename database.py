@@ -168,3 +168,96 @@ class DatabaseManager:
                 if not row:
                     return None
                 session_data = dict(row)
+                cur.execute("DELETE FROM active_session WHERE id = 1;")
+                return session_data
+
+    def record_confirmed_account(
+        self, username: str, x_user_id: str, x_name: str, x_created_at: Optional[str]
+    ) -> Tuple[bool, Dict[str, Any]]:
+        with FileLock(self.lock_path):
+            with self._transaction(immediate=True) as cur:
+                now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+                cur.execute("SELECT * FROM confirmed_accounts WHERE LOWER(username) = LOWER(?);", (username,))
+                existing = cur.fetchone()
+
+                seq_num: Optional[int] = None
+                if username.lower().startswith(self.prefix.lower()):
+                    suffix = username[len(self.prefix):]
+                    if suffix.isdigit():
+                        seq_num = int(suffix)
+
+                cur.execute("SELECT seq_num, username FROM active_session WHERE id = 1;")
+                active_sess = cur.fetchone()
+                session_closed = False
+
+                if active_sess and active_sess["username"].lower() == username.lower():
+                    seq_num = int(active_sess["seq_num"])
+                    cur.execute("DELETE FROM active_session WHERE id = 1;")
+                    session_closed = True
+
+                if existing:
+                    rec = dict(existing)
+                    rec["already_recorded"] = True
+                    rec["session_closed"] = session_closed
+                    return False, rec
+
+                cur.execute("""
+                    INSERT INTO confirmed_accounts (
+                        seq_num, username, x_user_id, x_name, x_created_at, public_discoverable, admin_verified, confirmed_at
+                    ) VALUES (?, ?, ?, ?, ?, 1, 1, ?);
+                """, (seq_num, username, x_user_id, x_name, x_created_at, now_iso))
+
+                next_seq = self._compute_safe_next_seq(cur)
+                cur.execute("UPDATE sequence_meta SET next_seq = ? WHERE id = 1;", (next_seq,))
+
+                cur.execute("SELECT * FROM confirmed_accounts WHERE LOWER(username) = LOWER(?);", (username,))
+                inserted = dict(cur.fetchone())
+                inserted["already_recorded"] = False
+                inserted["session_closed"] = session_closed
+                inserted["next_seq"] = next_seq
+                return True, inserted
+
+    def list_confirmed_accounts(self, limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:
+        with self._transaction(immediate=False) as cur:
+            cur.execute("""
+                SELECT seq_num, username, x_user_id, x_name, x_created_at, confirmed_at
+                FROM confirmed_accounts ORDER BY id DESC LIMIT ? OFFSET ?;
+            """, (limit, offset))
+            return [dict(r) for r in cur.fetchall()]
+
+    def get_account_by_username(self, username: str) -> Optional[Dict[str, Any]]:
+        with self._transaction(immediate=False) as cur:
+            cur.execute("""
+                SELECT seq_num, username, x_user_id, x_name, x_created_at, public_discoverable, admin_verified, confirmed_at
+                FROM confirmed_accounts WHERE LOWER(username) = LOWER(?);
+            """, (username,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def get_stats(self) -> Dict[str, Any]:
+        with self._transaction(immediate=False) as cur:
+            next_seq = self._compute_safe_next_seq(cur)
+            cur.execute("SELECT COUNT(*) AS cnt FROM confirmed_accounts;")
+            total_confirmed = int(cur.fetchone()["cnt"])
+            cur.execute("SELECT username, confirmed_at FROM confirmed_accounts ORDER BY id DESC LIMIT 1;")
+            latest = cur.fetchone()
+            cur.execute("SELECT seq_num, username, started_at FROM active_session WHERE id = 1;")
+            active_sess = cur.fetchone()
+            return {
+                "total_confirmed": total_confirmed,
+                "start_sequence": self.start_seq,
+                "next_seq": next_seq,
+                "next_username": self.format_username(next_seq),
+                "latest_account": dict(latest) if latest else None,
+                "active_session": dict(active_sess) if active_sess else None,
+            }
+
+    def check_health(self) -> Tuple[bool, str]:
+        try:
+            with self._transaction(immediate=False) as cur:
+                cur.execute("SELECT 1;")
+                cur.fetchone()
+            return True, "SQLite WAL operational"
+        except Exception as exc:
+            return False, f"SQLite error: {exc}"
